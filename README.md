@@ -8,3 +8,7 @@ before so it is the perfect chance.
  - 22-11-2021 : I have started the boilerplate code for Directx 12 and succeded to make a good old triangle. With little coloring it looks cool for a triangle 😎.
     
     ![](./Doc/Triangle-2021-11-22.jpg)
+
+ - 23-11-2021 : Setup simple texture pipeline now the triangle looks like *Jerry's Home* Door but just 🔵🟦 Blue.
+ 
+    ![](./Doc/Triangle-2021-11-23.jpg)

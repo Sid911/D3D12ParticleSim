@@ -67,4 +67,9 @@
       <Filter>Assets\Shaders</Filter>
     </CustomBuild>
   </ItemGroup>
+  <ItemGroup>
+    <None Include="..\README.md">
+      <Filter>Assets</Filter>
+    </None>
+  </ItemGroup>
 </Project>
