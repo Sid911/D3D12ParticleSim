@@ -1,5 +1,4 @@
 // D3D12ParticleSim.cpp : This file contains the 'main' function. Program execution begins and ends there.
-//
 
 #include "D3D12ParticleSim.h"
 #include "pch.h"

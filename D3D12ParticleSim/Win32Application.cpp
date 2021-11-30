@@ -6,13 +6,10 @@ HWND Win32Application::m_hwnd = nullptr;
 
 int Win32Application::Run(DXWindow* pWindow, HINSTANCE hInstance, int nCmdShow)
 {
-	// Parse the command line parameters
 	int argc;
 	LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 	pWindow->ParseCommandLineArgs(argv, argc);
 	LocalFree(argv);
-
-	// Initialize the window class.
 	WNDCLASSEX windowClass = { 0 };
 	windowClass.cbSize = sizeof(WNDCLASSEX);
 	windowClass.style = CS_HREDRAW | CS_VREDRAW;
@@ -24,8 +21,6 @@ int Win32Application::Run(DXWindow* pWindow, HINSTANCE hInstance, int nCmdShow)
 
 	RECT windowRect = { 0, 0, static_cast<LONG>(pWindow->GetWidth()), static_cast<LONG>(pWindow->GetHeight()) };
 	AdjustWindowRect(&windowRect, WS_OVERLAPPEDWINDOW, FALSE);
-
-	// Create the window and store a handle to it.
 	m_hwnd = CreateWindow(
 		windowClass.lpszClassName,
 		pWindow->GetTitle(),
@@ -34,21 +29,16 @@ int Win32Application::Run(DXWindow* pWindow, HINSTANCE hInstance, int nCmdShow)
 		CW_USEDEFAULT,
 		windowRect.right - windowRect.left,
 		windowRect.bottom - windowRect.top,
-		nullptr,		// We have no parent window.
-		nullptr,		// We aren't using menus.
+		nullptr,
+		nullptr,
 		hInstance,
 		pWindow);
-
-	// Initialize the sample. OnInit is defined in each child-implementation of DXSample.
 	pWindow->OnInit();
 
 	ShowWindow(m_hwnd, nCmdShow);
-
-	// Main sample loop.
 	MSG msg = {};
 	while (msg.message != WM_QUIT)
 	{
-		// Process any messages in the queue.
 		if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
 		{
 			TranslateMessage(&msg);
@@ -57,12 +47,8 @@ int Win32Application::Run(DXWindow* pWindow, HINSTANCE hInstance, int nCmdShow)
 	}
 
 	pWindow->OnDestroy();
-
-	// Return this part of the WM_QUIT message to Windows.
 	return static_cast<char>(msg.wParam);
 }
-
-// Main message handler for the sample.
 LRESULT CALLBACK Win32Application::WindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	DXWindow* pWindow = reinterpret_cast<DXWindow*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
@@ -71,7 +57,6 @@ LRESULT CALLBACK Win32Application::WindowProc(HWND hWnd, UINT message, WPARAM wP
 	{
 	case WM_CREATE:
 	{
-		// Save the DXSample* passed in to CreateWindow.
 		LPCREATESTRUCT pCreateStruct = reinterpret_cast<LPCREATESTRUCT>(lParam);
 		SetWindowLongPtr(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pCreateStruct->lpCreateParams));
 	}
@@ -103,7 +88,5 @@ LRESULT CALLBACK Win32Application::WindowProc(HWND hWnd, UINT message, WPARAM wP
 		PostQuitMessage(0);
 		return 0;
 	}
-
-	// Handle any messages the switch statement didn't.
 	return DefWindowProc(hWnd, message, wParam, lParam);
 }

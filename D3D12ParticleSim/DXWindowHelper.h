@@ -18,7 +18,6 @@ inline void GetAssetsPath(_Out_writes_(pathSize) WCHAR* path, UINT pathSize)
 	DWORD size = GetModuleFileName(nullptr, path, pathSize);
 	if (size == 0 || size == pathSize)
 	{
-		// Method failed or path was truncated.
 		throw;
 	}
 
@@ -68,8 +67,6 @@ inline HRESULT ReadDataFromFile(LPCWSTR filename, byte** data, UINT* size)
 
 	return S_OK;
 }
-
-// Assign a name to the object to aid with debugging.
 #if defined(_DEBUG)
 inline void SetName(ID3D12Object* pObject, LPCWSTR name)
 {
@@ -80,7 +77,4 @@ inline void SetName(ID3D12Object*, LPCWSTR)
 {
 }
 #endif
-
-// Naming helper for ComPtr<T>.
-// Assigns the name of the variable as the name of the object.
 #define NAME_D3D12_OBJECT(x) SetName(x.Get(), L#x)
