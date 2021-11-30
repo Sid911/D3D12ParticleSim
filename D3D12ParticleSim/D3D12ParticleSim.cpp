@@ -1,26 +1,72 @@
 #include "pch.h"
 #include "D3D12ParticleSim.h"
 #include <vector>
+#include <numeric>
+
+#ifdef min
+#undef min
+#endif
 
 using namespace Microsoft::WRL;
+
+// InterlockedCompareExchange returns the object's value if the 
+// comparison fails.  If it is already 0, then its value won't 
+// change and 0 will be returned.
+#define InterlockedGetValue(object) InterlockedCompareExchange(object, 0, 0)
+
+const float D3D12ParticleSim::ParticleSpread = 400.0f;
+
+namespace {
+	void WaitForFence(ID3D12Fence* fence, UINT64 fenceValue, HANDLE fenceEvent)
+	{
+		if (fence->GetCompletedValue() < fenceValue) {
+			ThrowIfFailed(fence->SetEventOnCompletion(fenceValue, fenceEvent));
+			WaitForSingleObject(fenceEvent, INFINITE);
+		}
+	}
+}
 
 D3D12ParticleSim::D3D12ParticleSim(UINT width, UINT height, std::wstring name) :
 	DXWindow(width, height, name),
 	m_frameIndex(0),
 	m_viewport(),
 	m_scissorRect(),
-	m_rtvDescriptorSize(0)
+	m_rtvDescriptorSize(0),
+	m_srvUavDescriptorSize(0),
+	m_pConstantBufferGSData(nullptr)
 {
+	ZeroMemory(m_frameFenceValues, sizeof(m_frameFenceValues));
+
 	m_viewport.Width = static_cast<float>(width);
 	m_viewport.Height = static_cast<float>(height);
 	m_viewport.MaxDepth = 1.0f;
 
 	m_scissorRect.right = static_cast<LONG>(width);
 	m_scissorRect.bottom = static_cast<LONG>(height);
+
+
+	ZeroMemory(m_computeFenceValues, sizeof(m_computeFenceValues));
+	ZeroMemory(m_graphicsFenceValues, sizeof(m_graphicsFenceValues));
+	ZeroMemory(m_graphicsCopyFenceValues, sizeof(m_graphicsCopyFenceValues));
+
+	m_srvIndex = 0;
+
+	m_computeFenceValue = 1;
+	m_graphicsFenceValue = 1;
+	m_graphicsCopyFenceValue = 1;
+
+	m_queryReadbackIndex = -(static_cast<int> (FrameCount));
+
+	m_frameTimeNextEntry = 0;
+	m_frameTimeEntryCount = 0;
 }
 
 void D3D12ParticleSim::OnInit()
 {
+	// Initialize camera
+	m_camera.Init({ 0.0f, 0.0f, 1500.0f });
+	m_camera.SetMoveSpeed(250.0f);
+
 	LoadPipeline();
 	LoadAssets();
 }
@@ -32,6 +78,11 @@ void D3D12ParticleSim::LoadPipeline()
 		if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController))))
 		{
 			debugController->EnableDebugLayer();
+			// Additional Debug config
+			ComPtr<ID3D12Debug1> debugController1;
+			debugController->QueryInterface(IID_PPV_ARGS(&debugController1));
+
+			debugController1->SetEnableGPUBasedValidation(true);
 		}
 	}
 #endif
@@ -65,7 +116,10 @@ void D3D12ParticleSim::LoadPipeline()
 	queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
 	queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 
-	ThrowIfFailed(m_device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_commandQueue)));
+	ThrowIfFailed(m_device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_graphicsCommandQueue)));
+	NAME_D3D12_OBJECT(m_graphicsCommandQueue);
+	m_graphicsCommandQueue->GetTimestampFrequency(&m_frequency);
+
 	DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
 	swapChainDesc.BufferCount = FrameCount;
 	swapChainDesc.BufferDesc.Width = m_width;
@@ -76,10 +130,11 @@ void D3D12ParticleSim::LoadPipeline()
 	swapChainDesc.OutputWindow = Win32Application::GetHwnd();
 	swapChainDesc.SampleDesc.Count = 1;
 	swapChainDesc.Windowed = TRUE;
+	swapChainDesc.Flags = 0;
 
 	ComPtr<IDXGISwapChain> swapChain;
 	ThrowIfFailed(factory->CreateSwapChain(
-		m_commandQueue.Get(),
+		m_graphicsCommandQueue.Get(),
 		&swapChainDesc,
 		&swapChain
 	));
@@ -88,21 +143,24 @@ void D3D12ParticleSim::LoadPipeline()
 	ThrowIfFailed(factory->MakeWindowAssociation(Win32Application::GetHwnd(), DXGI_MWA_NO_ALT_ENTER));
 
 	m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+	m_lastFrameIndex = m_frameIndex;
 	{
 		D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
 		rtvHeapDesc.NumDescriptors = FrameCount;
 		rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
 		rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-		ThrowIfFailed(m_device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&m_rtvHeap)));
+		ThrowIfFailed(m_device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&m_rtvHeap)));\
 
-		D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-		srvHeapDesc.NumDescriptors = 1;
-		srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-		srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
-		ThrowIfFailed(m_device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&m_srvHeap)));
+		D3D12_DESCRIPTOR_HEAP_DESC srvUavHeapDesc = {};
+		srvUavHeapDesc.NumDescriptors = DescriptorCount;
+		srvUavHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		srvUavHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+		ThrowIfFailed(m_device->CreateDescriptorHeap(&srvUavHeapDesc, IID_PPV_ARGS(&m_srvUavHeap)));
+		NAME_D3D12_OBJECT(m_srvUavHeap);
 
 		m_rtvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+		m_srvUavDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 	}
 	{
 		CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(m_rtvHeap->GetCPUDescriptorHandleForHeapStart());
@@ -113,45 +171,137 @@ void D3D12ParticleSim::LoadPipeline()
 			rtvHandle.Offset(1, m_rtvDescriptorSize);
 		}
 	}
+	// graphics resources
+	{
+		for (int i = 0; i < FrameCount; ++i) {
+			ThrowIfFailed(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_graphicsAllocators[i])));
+			ThrowIfFailed(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_graphicsAllocators[i].Get(), nullptr, IID_PPV_ARGS(&m_graphicsCommandLists[i])));
+			ThrowIfFailed(m_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&m_graphicsFences[i])));
 
-	ThrowIfFailed(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_commandAllocator)));
+			wchar_t buffer[64] = {};
+			swprintf_s(buffer, L"m_graphicsCommandLists[%i]", i);
+			SetName(m_graphicsCommandLists[i].Get(), buffer);
+			m_graphicsCommandLists[i]->Close();
+
+			swprintf_s(buffer, L"m_graphicsAllocators[%i]", i);
+			SetName(m_graphicsAllocators[i].Get(), buffer);
+
+			ThrowIfFailed(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_graphicsCopyAllocators[i])));
+			ThrowIfFailed(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_graphicsCopyAllocators[i].Get(), nullptr, IID_PPV_ARGS(&m_graphicsCopyCommandLists[i])));
+
+			swprintf_s(buffer, L"m_graphicsCopyCommandLists[%i]", i);
+			SetName(m_graphicsCopyCommandLists[i].Get(), buffer);
+			swprintf_s(buffer, L"m_graphicsCopyAllocators[%i]", i);
+			SetName(m_graphicsCopyAllocators[i].Get(), buffer);
+
+			ThrowIfFailed(m_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&m_graphicsCopyFences[i])));
+
+			m_graphicsCopyCommandLists[i]->Close();
+		}
+	}
+	// compute resources
+	if (AsynchronousComputeEnabled)
+	{
+		D3D12_COMMAND_QUEUE_DESC queueDesc = { D3D12_COMMAND_LIST_TYPE_COMPUTE, 0, D3D12_COMMAND_QUEUE_FLAG_NONE };
+		ThrowIfFailed(m_device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_computeCommandQueue)));
+		NAME_D3D12_OBJECT(m_computeCommandQueue);
+
+		for (int i = 0; i < FrameCount; ++i) {
+			ThrowIfFailed(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&m_computeAllocators[i])));
+			ThrowIfFailed(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, m_computeAllocators[i].Get(), nullptr, IID_PPV_ARGS(&m_computeCommandLists[i])));
+			ThrowIfFailed(m_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&m_computeFences[i])));
+
+			wchar_t buffer[64] = {};
+			swprintf_s(buffer, L"m_computeCommandLists[%i] (compute queue)", i);
+			SetName(m_computeCommandLists[i].Get(), buffer);
+			swprintf_s(buffer, L"m_computeAllocators[%i]", i);
+			SetName(m_computeAllocators[i].Get(), buffer);
+
+			m_computeCommandLists[i]->Close();
+		}
+	}
+	else
+	{
+		for (int i = 0; i < FrameCount; ++i) {
+			ThrowIfFailed(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_computeAllocators[i])));
+			ThrowIfFailed(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_computeAllocators[i].Get(), nullptr, IID_PPV_ARGS(&m_computeCommandLists[i])));
+
+			wchar_t buffer[64] = {};
+			swprintf_s(buffer, L"m_computeCommandLists[%i] (graphics queue)", i);
+			SetName(m_computeCommandLists[i].Get(), buffer);
+			swprintf_s(buffer, L"m_computeAllocators[%i]", i);
+			SetName(m_computeAllocators[i].Get(), buffer);
+
+			ThrowIfFailed(m_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&m_computeFences[i])));
+
+			m_computeCommandLists[i]->Close();
+		}
+	}
+
+	// timing resources
+	{
+		D3D12_RESOURCE_DESC cpuTimingBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(
+			sizeof(UINT64));
+
+		for (int i = 0; i < FrameCount; ++i) {
+			m_device->CreateCommittedResource(
+				&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK),
+				D3D12_HEAP_FLAG_NONE,
+				&cpuTimingBufferDesc,
+				D3D12_RESOURCE_STATE_COPY_DEST,
+				nullptr,
+				IID_PPV_ARGS(&m_timeQueryReadbackBuffer[i]));
+		}
+
+		D3D12_QUERY_HEAP_DESC queryHeapDesc = {};
+		queryHeapDesc.Count = FrameCount; // Query at end of frame
+		queryHeapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+
+		m_device->CreateQueryHeap(&queryHeapDesc,
+			IID_PPV_ARGS(&m_timeQueryHeap));
+		NAME_D3D12_OBJECT(m_timeQueryHeap);
+	}
 }
+
+
 void D3D12ParticleSim::LoadAssets()
 {
 	{
 
-		CD3DX12_DESCRIPTOR_RANGE ranges[1];
-		CD3DX12_ROOT_PARAMETER rootParameters[1];
+		CD3DX12_DESCRIPTOR_RANGE ranges[2];
 
 		ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
-		rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
-		D3D12_STATIC_SAMPLER_DESC sampler = {};
-		sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-		sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-		sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-		sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-		sampler.MipLODBias = 0;
-		sampler.MaxAnisotropy = 0;
-		sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-		sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-		sampler.MinLOD = 0.0f;
-		sampler.MaxLOD = D3D12_FLOAT32_MAX;
-		sampler.ShaderRegister = 0;
-		sampler.RegisterSpace = 0;
-		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
 
+		CD3DX12_ROOT_PARAMETER rootParameters[RootParametersCount];
+		rootParameters[RootParameterCB].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
+		rootParameters[RootParameterSRV].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_VERTEX);
+		rootParameters[RootParameterUAV].InitAsDescriptorTable(1, &ranges[1], D3D12_SHADER_VISIBILITY_ALL);
 
+		// The rendering pipeline does not need the UAV parameter.
 		CD3DX12_ROOT_SIGNATURE_DESC rootSignatureDesc;
-		rootSignatureDesc.Init(_countof(rootParameters), rootParameters, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+		rootSignatureDesc.Init(_countof(rootParameters) - 1, rootParameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
 		ComPtr<ID3DBlob> signature;
 		ComPtr<ID3DBlob> error;
 		ThrowIfFailed(D3D12SerializeRootSignature(&rootSignatureDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error));
 		ThrowIfFailed(m_device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&m_rootSignature)));
+		NAME_D3D12_OBJECT(m_rootSignature);
+
+		// Create compute signature. Must change visibility for the SRV.
+		rootParameters[RootParameterSRV].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+		CD3DX12_ROOT_SIGNATURE_DESC computeRootSignatureDesc(_countof(rootParameters), rootParameters, 0, nullptr);
+		ThrowIfFailed(D3D12SerializeRootSignature(&computeRootSignatureDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error));
+
+		ThrowIfFailed(m_device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&m_computeRootSignature)));
+		NAME_D3D12_OBJECT(m_computeRootSignature);
 	}
 	{
 		ComPtr<ID3DBlob> vertexShader;
+		ComPtr<ID3DBlob> geometryShader;
 		ComPtr<ID3DBlob> pixelShader;
+		ComPtr<ID3DBlob> computeShader;
 
 #if defined(_DEBUG)
 		UINT compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
@@ -159,212 +309,701 @@ void D3D12ParticleSim::LoadAssets()
 		UINT compileFlags = 0;
 #endif
 
-		ThrowIfFailed(D3DCompileFromFile(GetAssetFullPath(L"shaders.hlsl").c_str(), nullptr, nullptr, "VSMain", "vs_5_0", compileFlags, 0, &vertexShader, nullptr));
-		ThrowIfFailed(D3DCompileFromFile(GetAssetFullPath(L"shaders.hlsl").c_str(), nullptr, nullptr, "PSMain", "ps_5_0", compileFlags, 0, &pixelShader, nullptr));
+		ThrowIfFailed(D3DCompileFromFile(GetAssetFullPath(L"ParticleDraw.hlsl").c_str(), nullptr, nullptr, "VSParticleDraw", "vs_5_0", compileFlags, 0, &vertexShader, nullptr));
+		ThrowIfFailed(D3DCompileFromFile(GetAssetFullPath(L"ParticleDraw.hlsl").c_str(), nullptr, nullptr, "GSParticleDraw", "gs_5_0", compileFlags, 0, &geometryShader, nullptr));
+		ThrowIfFailed(D3DCompileFromFile(GetAssetFullPath(L"ParticleDraw.hlsl").c_str(), nullptr, nullptr, "PSParticleDraw", "ps_5_0", compileFlags, 0, &pixelShader, nullptr));
+		ThrowIfFailed(D3DCompileFromFile(GetAssetFullPath(L"ParticleSim.hlsl").c_str(), nullptr, nullptr, "CSMain", "cs_5_0", compileFlags, 0, &computeShader, nullptr));
+
 		D3D12_INPUT_ELEMENT_DESC inputElementDescs[] =
 		{
-			{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-			{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+			{ "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 		};
+
+		// Describe the blend and depth states.
+		CD3DX12_BLEND_DESC blendDesc(D3D12_DEFAULT);
+		blendDesc.RenderTarget[0].BlendEnable = TRUE;
+		blendDesc.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+		blendDesc.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+		blendDesc.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ZERO;
+		blendDesc.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+
+		CD3DX12_DEPTH_STENCIL_DESC depthStencilDesc(D3D12_DEFAULT);
+		depthStencilDesc.DepthEnable = FALSE;
+		depthStencilDesc.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+
+		// Describe and create the graphics pipeline state object (PSO).
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
 		psoDesc.InputLayout = { inputElementDescs, _countof(inputElementDescs) };
 		psoDesc.pRootSignature = m_rootSignature.Get();
 		psoDesc.VS = CD3DX12_SHADER_BYTECODE(vertexShader.Get());
+		psoDesc.GS = CD3DX12_SHADER_BYTECODE(geometryShader.Get());
 		psoDesc.PS = CD3DX12_SHADER_BYTECODE(pixelShader.Get());
 		psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-		psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
-		psoDesc.DepthStencilState.DepthEnable = FALSE;
-		psoDesc.DepthStencilState.StencilEnable = FALSE;
+		psoDesc.BlendState = blendDesc;
+		psoDesc.DepthStencilState = depthStencilDesc;
 		psoDesc.SampleMask = UINT_MAX;
-		psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
 		psoDesc.NumRenderTargets = 1;
 		psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+		psoDesc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
 		psoDesc.SampleDesc.Count = 1;
+
 		ThrowIfFailed(m_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&m_pipelineState)));
+		NAME_D3D12_OBJECT(m_pipelineState);
+
+		// Describe and create the compute pipeline state object (PSO).
+		D3D12_COMPUTE_PIPELINE_STATE_DESC computePsoDesc = {};
+		computePsoDesc.pRootSignature = m_computeRootSignature.Get();
+		computePsoDesc.CS = CD3DX12_SHADER_BYTECODE(computeShader.Get());
+
+		ThrowIfFailed(m_device->CreateComputePipelineState(&computePsoDesc, IID_PPV_ARGS(&m_computeState)));
+		NAME_D3D12_OBJECT(m_computeState);
 	}
 
-	ThrowIfFailed(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_commandAllocator.Get(), m_pipelineState.Get(), IID_PPV_ARGS(&m_commandList)));
-	{
-		Vertex triangleVertices[] = {
-			{ { 0.0f, 0.25f * m_aspectRatio, 0.0f }, { 0.5f, 0.0f } },
-			{ { 0.25f, -0.25f * m_aspectRatio, 0.0f }, { 1.0f, 1.0f } },
-			{ { -0.25f, -0.25f * m_aspectRatio, 0.0f }, { 0.0f, 1.0f } }
-		};
+	ThrowIfFailed(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_uploadCommandAllocator)));
+	ThrowIfFailed(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_uploadCommandAllocator.Get(), m_pipelineState.Get(), IID_PPV_ARGS(&m_uploadCommandList)));
+	NAME_D3D12_OBJECT(m_uploadCommandList);
 
-		const UINT vertexBufferSize = sizeof(triangleVertices);
-		ThrowIfFailed(m_device->CreateCommittedResource(
-			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
-			D3D12_HEAP_FLAG_NONE,
-			&CD3DX12_RESOURCE_DESC::Buffer(vertexBufferSize),
-			D3D12_RESOURCE_STATE_GENERIC_READ,
-			nullptr,
-			IID_PPV_ARGS(&m_vertexBuffer)));
-		UINT8* pVertexDataBegin;
-		CD3DX12_RANGE readRange(0, 0);
-		ThrowIfFailed(m_vertexBuffer->Map(0, &readRange, reinterpret_cast<void**>(&pVertexDataBegin)));
-		memcpy(pVertexDataBegin, triangleVertices, sizeof(triangleVertices));
-		m_vertexBuffer->Unmap(0, nullptr);
-		m_vertexBufferView.BufferLocation = m_vertexBuffer->GetGPUVirtualAddress();
-		m_vertexBufferView.StrideInBytes = sizeof(Vertex);
-		m_vertexBufferView.SizeInBytes = vertexBufferSize;
-	}
-	ComPtr<ID3D12Resource> textureUploadHeap;
+	CreateVertexBuffer();
+	CreateParticleBuffers();
+
+	// Note: ComPtr's are CPU objects but this resource needs to stay in scope until
+	// the command list that references it has finished executing on the GPU.
+	// We will flush the GPU at the end of this method to ensure the resource is not
+	// prematurely destroyed.
+	ComPtr<ID3D12Resource> constantBufferCSUpload;
 	{
-		D3D12_RESOURCE_DESC textureDesc = {};
-		textureDesc.MipLevels = 1;
-		textureDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-		textureDesc.Width = TextureWidth;
-		textureDesc.Height = TextureHeight;
-		textureDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-		textureDesc.DepthOrArraySize = 1;
-		textureDesc.SampleDesc.Count = 1;
-		textureDesc.SampleDesc.Quality = 0;
-		textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		const UINT bufferSize = sizeof(ConstantBufferCS);
 
 		ThrowIfFailed(m_device->CreateCommittedResource(
 			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
 			D3D12_HEAP_FLAG_NONE,
-			&textureDesc,
+			&CD3DX12_RESOURCE_DESC::Buffer(bufferSize),
 			D3D12_RESOURCE_STATE_COPY_DEST,
-			nullptr, IID_PPV_ARGS(&m_texture)
-		)
-		);
+			nullptr,
+			IID_PPV_ARGS(&m_constantBufferCS)));
 
-		const UINT64 uploadBufferSize = GetRequiredIntermediateSize(m_texture.Get(), 0, 1);
 		ThrowIfFailed(m_device->CreateCommittedResource(
 			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
 			D3D12_HEAP_FLAG_NONE,
-			&CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize),
+			&CD3DX12_RESOURCE_DESC::Buffer(bufferSize),
 			D3D12_RESOURCE_STATE_GENERIC_READ,
 			nullptr,
-			IID_PPV_ARGS(&textureUploadHeap)
-		)
-		);
-		std::vector<UINT8> texture = GenerateTextureData();
+			IID_PPV_ARGS(&constantBufferCSUpload)));
 
-		D3D12_SUBRESOURCE_DATA textureData = {};
-		textureData.pData = &texture[0];
-		textureData.RowPitch = TextureWidth * TexturePixelSize;
-		textureData.SlicePitch = textureData.RowPitch * TextureHeight;
+		NAME_D3D12_OBJECT(m_constantBufferCS);
 
-		UpdateSubresources(m_commandList.Get(), m_texture.Get(), textureUploadHeap.Get(), 0, 0, 1, &textureData);
-		m_commandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
-		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-		srvDesc.Format = textureDesc.Format;
-		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-		srvDesc.Texture2D.MipLevels = 1;
-		m_device->CreateShaderResourceView(m_texture.Get(), &srvDesc, m_srvHeap->GetCPUDescriptorHandleForHeapStart());
+		ConstantBufferCS constantBufferCS = {};
+		constantBufferCS.param[0] = ParticleCount;
+		constantBufferCS.param[1] = int(ceil(ParticleCount / 256.0f));
+		constantBufferCS.paramf[0] = 0.1f;
+		constantBufferCS.paramf[1] = 1.0f;
+
+		D3D12_SUBRESOURCE_DATA computeCBData = {};
+		computeCBData.pData = reinterpret_cast<UINT8*>(&constantBufferCS);
+		computeCBData.RowPitch = bufferSize;
+		computeCBData.SlicePitch = computeCBData.RowPitch;
+
+		UpdateSubresources<1>(m_uploadCommandList.Get(), m_constantBufferCS.Get(), constantBufferCSUpload.Get(), 0, 0, 1, &computeCBData);
+		m_uploadCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_constantBufferCS.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER));
 	}
-	ThrowIfFailed(m_commandList->Close());
-	ID3D12CommandList* ppCommandLists[] = { m_commandList.Get() };
-	m_commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
+
+	// Create the geometry shader's constant buffer.
 	{
-		ThrowIfFailed(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)));
-		m_fenceValue = 1;
-		m_fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-		if (m_fenceEvent == nullptr)
-		{
-			ThrowIfFailed(HRESULT_FROM_WIN32(GetLastError()));
-		}
-		WaitForPreviousFrame();
+		const UINT constantBufferGSSize = sizeof(ConstantBufferGS) * FrameCount;
+
+		ThrowIfFailed(m_device->CreateCommittedResource(
+			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+			D3D12_HEAP_FLAG_NONE,
+			&CD3DX12_RESOURCE_DESC::Buffer(constantBufferGSSize),
+			D3D12_RESOURCE_STATE_GENERIC_READ,
+			nullptr,
+			IID_PPV_ARGS(&m_constantBufferGS)
+		));
+
+		NAME_D3D12_OBJECT(m_constantBufferGS);
+
+		CD3DX12_RANGE readRange(0, 0);		// We do not intend to read from this resource on the CPU.
+		ThrowIfFailed(m_constantBufferGS->Map(0, &readRange, reinterpret_cast<void**>(&m_pConstantBufferGSData)));
+		ZeroMemory(m_pConstantBufferGSData, constantBufferGSSize);
+	}
+
+	// Close the command list and execute it to begin the initial GPU setup.
+	ThrowIfFailed(m_uploadCommandList->Close());
+	ID3D12CommandList* ppCommandLists[] = { m_uploadCommandList.Get() };
+	m_graphicsCommandQueue->ExecuteCommandLists(1, ppCommandLists);
+
+	m_frameFenceValue = 0;
+	for (int i = 0; i < FrameCount; ++i) {
+		m_frameFenceValues[i] = m_frameFenceValue;
+		m_device->CreateFence(m_frameFenceValues[i], D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_frameFences[i]));
+		m_frameFenceEvents[i] = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
+		m_graphicsFenceValues[i] = 0;
+		ThrowIfFailed(m_device->CreateFence(m_graphicsFenceValues[i], D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_graphicsFences[i])));
+		m_graphicsFenceEvents[i] = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
+		m_graphicsCopyFenceValues[i] = 0;
+		ThrowIfFailed(m_device->CreateFence(m_graphicsCopyFenceValues[i], D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_graphicsCopyFences[i])));
+		m_graphicsCopyFenceEvents[i] = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
+		m_computeFenceValues[i] = 0;
+		ThrowIfFailed(m_device->CreateFence(m_computeFenceValues[i], D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_computeFences[i])));
+		m_computeFenceEvents[i] = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+	}
+
+	{
+		m_uploadFenceValue = 0;
+		ThrowIfFailed(m_device->CreateFence(m_uploadFenceValue, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_uploadFence)));
+
+		m_uploadEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
+		m_graphicsCommandQueue->Signal(m_uploadFence.Get(), 1);
+		WaitForFence(m_uploadFence.Get(), 1, m_uploadEvent);
 	}
 }
 
-std::vector<UINT8> D3D12ParticleSim::GenerateTextureData()
+void D3D12ParticleSim::CreateVertexBuffer()
 {
-	const UINT rowPitch = TextureWidth * TexturePixelSize;
-	const UINT cellPitch = rowPitch >> 3;
-	const UINT cellHeight = TextureWidth >> 3;
-	const UINT textureSize = rowPitch * TextureHeight;
-
-	std::vector<UINT8> data(textureSize);
-	UINT8* pData = &data[0];
-
-	for (UINT n = 0; n < textureSize; n += TexturePixelSize)
+	std::vector<ParticleVertex> vertices;
+	vertices.resize(ParticleCount);
+	for (UINT i = 0; i < ParticleCount; i++)
 	{
-		UINT x = n % rowPitch;
-		UINT y = n / rowPitch;
-		UINT i = x / cellPitch;
-		UINT j = y / cellHeight;
-
-		if (i % 2 == j % 2)
-		{
-			pData[n] = 0x19;
-			pData[n + 1] = 0xff;
-			pData[n + 2] = 0xff;
-			pData[n + 3] = 0xff;
-		}
-		else
-		{
-			pData[n] = 0xff;
-			pData[n + 1] = 0xff;
-			pData[n + 2] = 0xff;
-			pData[n + 3] = 0xff;
-		}
+		vertices[i].color = XMFLOAT4(1.0f, 1.0f, 0.2f, 1.0f);
 	}
+	const UINT bufferSize = ParticleCount * sizeof(ParticleVertex);
 
-	return data;
+	ThrowIfFailed(m_device->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(bufferSize),
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		nullptr,
+		IID_PPV_ARGS(&m_vertexBuffer)));
+
+	ThrowIfFailed(m_device->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(bufferSize),
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr,
+		IID_PPV_ARGS(&m_vertexBufferUpload)));
+
+	NAME_D3D12_OBJECT(m_vertexBuffer);
+
+	D3D12_SUBRESOURCE_DATA vertexData = {};
+	vertexData.pData = reinterpret_cast<UINT8*>(&vertices[0]);
+	vertexData.RowPitch = bufferSize;
+	vertexData.SlicePitch = vertexData.RowPitch;
+
+	UpdateSubresources<1>(m_uploadCommandList.Get(), m_vertexBuffer.Get(), m_vertexBufferUpload.Get(), 0, 0, 1, &vertexData);
+	m_uploadCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_vertexBuffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER));
+
+	m_vertexBufferView.BufferLocation = m_vertexBuffer->GetGPUVirtualAddress();
+	m_vertexBufferView.SizeInBytes = static_cast<UINT>(bufferSize);
+	m_vertexBufferView.StrideInBytes = sizeof(ParticleVertex);
+}
+
+// Random percent value, from -1 to 1.
+float D3D12ParticleSim::RandomPercent()
+{
+	float ret = static_cast<float>((rand() % 10000) - 5000);
+	return ret / 5000.0f;
+}
+
+void D3D12ParticleSim::LoadParticles(_Out_writes_(numParticles) Particle* pParticles, const XMFLOAT3& center, const XMFLOAT4& velocity, float spread, UINT numParticles)
+{
+	srand(0);
+	for (UINT i = 0; i < numParticles; i++)
+	{
+		XMFLOAT3 delta(spread, spread, spread);
+
+		while (XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&delta))) > spread * spread)
+		{
+			delta.x = RandomPercent() * spread;
+			delta.y = RandomPercent() * spread;
+			delta.z = RandomPercent() * spread;
+		}
+
+		pParticles[i].position.x = center.x + delta.x;
+		pParticles[i].position.y = center.y + delta.y;
+		pParticles[i].position.z = center.z + delta.z;
+		pParticles[i].position.w = 10000.0f * 10000.0f;
+
+		pParticles[i].velocity = velocity;
+	}
+}
+
+// Create the position and velocity buffer shader resources.
+void D3D12ParticleSim::CreateParticleBuffers()
+{
+	// Initialize the data in the buffers.
+	std::vector<Particle> data;
+	data.resize(ParticleCount);
+	const UINT dataSize = ParticleCount * sizeof(Particle);
+
+	// Split the particles into two groups.
+	float centerSpread = ParticleSpread * 0.50f;
+	LoadParticles(&data[0], XMFLOAT3(centerSpread, 0, 0), XMFLOAT4(0, 0, -20, 1 / 100000000.0f), ParticleSpread, ParticleCount / 2);
+	LoadParticles(&data[ParticleCount / 2], XMFLOAT3(-centerSpread, 0, 0), XMFLOAT4(0, 0, 20, 1 / 100000000.0f), ParticleSpread, ParticleCount / 2);
+
+	D3D12_HEAP_PROPERTIES defaultHeapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+	D3D12_HEAP_PROPERTIES uploadHeapProperties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+	D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(dataSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+	D3D12_RESOURCE_DESC uploadBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(dataSize);
+
+	// Create two buffers in the GPU, each with a copy of the particles data.
+	// The compute shader will update one of them while the rendering thread 
+	// renders the other. When rendering completes, the threads will swap 
+	// which buffer they work on.
+
+	ThrowIfFailed(m_device->CreateCommittedResource(
+		&defaultHeapProperties,
+		D3D12_HEAP_FLAG_NONE,
+		&bufferDesc,
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		nullptr,
+		IID_PPV_ARGS(&m_particleBuffer0)));
+
+	ThrowIfFailed(m_device->CreateCommittedResource(
+		&defaultHeapProperties,
+		D3D12_HEAP_FLAG_NONE,
+		&bufferDesc,
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		nullptr,
+		IID_PPV_ARGS(&m_particleBuffer1)));
+
+	ThrowIfFailed(m_device->CreateCommittedResource(
+		&uploadHeapProperties,
+		D3D12_HEAP_FLAG_NONE,
+		&uploadBufferDesc,
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr,
+		IID_PPV_ARGS(&m_particleBuffer0Upload)));
+
+	ThrowIfFailed(m_device->CreateCommittedResource(
+		&uploadHeapProperties,
+		D3D12_HEAP_FLAG_NONE,
+		&uploadBufferDesc,
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr,
+		IID_PPV_ARGS(&m_particleBuffer1Upload)));
+
+	ThrowIfFailed(m_device->CreateCommittedResource(
+		&defaultHeapProperties,
+		D3D12_HEAP_FLAG_NONE,
+		&bufferDesc,
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		nullptr,
+		IID_PPV_ARGS(&m_particleBufferForDraw)));
+
+
+	SetName(m_particleBuffer0.Get(), L"m_particleBuffer0");
+	SetName(m_particleBuffer1.Get(), L"m_particleBuffer1");
+	SetName(m_particleBufferForDraw.Get(), L"m_particleBufferForDraw");
+
+	D3D12_SUBRESOURCE_DATA particleData = {};
+	particleData.pData = reinterpret_cast<UINT8*>(&data[0]);
+	particleData.RowPitch = dataSize;
+	particleData.SlicePitch = particleData.RowPitch;
+
+	UpdateSubresources<1>(m_uploadCommandList.Get(), m_particleBuffer0.Get(), m_particleBuffer0Upload.Get(), 0, 0, 1, &particleData);
+	UpdateSubresources<1>(m_uploadCommandList.Get(), m_particleBuffer1.Get(), m_particleBuffer1Upload.Get(), 0, 0, 1, &particleData);
+	m_uploadCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_particleBuffer0.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+	m_uploadCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_particleBuffer1.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+	srvDesc.Buffer.FirstElement = 0;
+	srvDesc.Buffer.NumElements = ParticleCount;
+	srvDesc.Buffer.StructureByteStride = sizeof(Particle);
+	srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+
+	CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle0(m_srvUavHeap->GetCPUDescriptorHandleForHeapStart(), SrvParticlePosVelo0, m_srvUavDescriptorSize);
+	CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle1(m_srvUavHeap->GetCPUDescriptorHandleForHeapStart(), SrvParticlePosVelo1, m_srvUavDescriptorSize);
+	m_device->CreateShaderResourceView(m_particleBuffer0.Get(), &srvDesc, srvHandle0);
+	m_device->CreateShaderResourceView(m_particleBuffer1.Get(), &srvDesc, srvHandle1);
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+	uavDesc.Format = DXGI_FORMAT_UNKNOWN;
+	uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+	uavDesc.Buffer.FirstElement = 0;
+	uavDesc.Buffer.NumElements = ParticleCount;
+	uavDesc.Buffer.StructureByteStride = sizeof(Particle);
+	uavDesc.Buffer.CounterOffsetInBytes = 0;
+	uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+
+	CD3DX12_CPU_DESCRIPTOR_HANDLE uavHandle0(m_srvUavHeap->GetCPUDescriptorHandleForHeapStart(), UavParticlePosVelo0, m_srvUavDescriptorSize);
+	CD3DX12_CPU_DESCRIPTOR_HANDLE uavHandle1(m_srvUavHeap->GetCPUDescriptorHandleForHeapStart(), UavParticlePosVelo1, m_srvUavDescriptorSize);
+	m_device->CreateUnorderedAccessView(m_particleBuffer0.Get(), nullptr, &uavDesc, uavHandle0);
+	m_device->CreateUnorderedAccessView(m_particleBuffer1.Get(), nullptr, &uavDesc, uavHandle1);
+
+	CD3DX12_CPU_DESCRIPTOR_HANDLE copyHandle(m_srvUavHeap->GetCPUDescriptorHandleForHeapStart(), SrvParticleForDraw, m_srvUavDescriptorSize);
+	m_device->CreateShaderResourceView(m_particleBufferForDraw.Get(), &srvDesc, copyHandle);
 }
 void D3D12ParticleSim::OnUpdate()
 {
+	// Wait for the previous Present to complete.
+// WaitForSingleObjectEx(m_swapChainEvent, 100, FALSE);
+
+	m_timer.Tick(NULL);
+	m_camera.Update(static_cast<float>(m_timer.GetElapsedSeconds()));
+
+	ConstantBufferGS constantBufferGS = {};
+	XMStoreFloat4x4(&constantBufferGS.worldViewProjection, XMMatrixMultiply(m_camera.GetViewMatrix(), m_camera.GetProjectionMatrix(0.8f, m_aspectRatio, 1.0f, 5000.0f)));
+	XMStoreFloat4x4(&constantBufferGS.inverseView, XMMatrixInverse(nullptr, m_camera.GetViewMatrix()));
+
+	UINT8* destination = m_pConstantBufferGSData + sizeof(ConstantBufferGS) * m_frameIndex;
+	memcpy(destination, &constantBufferGS, sizeof(ConstantBufferGS));
 }
 void D3D12ParticleSim::OnRender()
 {
-	PopulateCommandList();
-	ID3D12CommandList* ppCommandLists[] = { m_commandList.Get() };
-	m_commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
-	ThrowIfFailed(m_swapChain->Present(1, 0));
+	// Wait for graphics fence to finish
+	if (AsynchronousComputeEnabled) {
+		PIXBeginEvent(m_computeCommandQueue.Get(), 0, L"Simulate");
+		m_computeCommandQueue->Wait(m_graphicsCopyFences[m_lastFrameIndex].Get(), m_graphicsCopyFenceValues[m_lastFrameIndex]);
+	}
+	else {
+		PIXBeginEvent(m_graphicsCommandQueue.Get(), 0, L"Simulate");
+	}
+	RecordComputeCommandList();
 
-	WaitForPreviousFrame();
+	// Close and execute the command list.
+	ID3D12CommandList* ppCommandLists[] = { m_computeCommandLists[m_frameIndex].Get() };
+
+	if (AsynchronousComputeEnabled) {
+		m_computeCommandQueue->ExecuteCommandLists(1, ppCommandLists);
+		m_computeFenceValues[m_frameIndex] = m_computeFenceValue;
+		m_computeCommandQueue->Signal(m_computeFences[m_frameIndex].Get(), m_computeFenceValue);
+		PIXEndEvent(m_computeCommandQueue.Get());
+	}
+	else {
+		m_graphicsCommandQueue->ExecuteCommandLists(1, ppCommandLists);
+		PIXEndEvent(m_graphicsCommandQueue.Get());
+	}
+
+	++m_computeFenceValue;
+
+	RecordCopyCommandList();
+
+	ppCommandLists[0] = { m_graphicsCopyCommandLists[m_frameIndex].Get() };
+
+	// Wait for compute fence to finish
+	if (AsynchronousComputeEnabled) {
+		m_graphicsCommandQueue->Wait(m_computeFences[m_frameIndex].Get(), m_computeFenceValues[m_frameIndex]);
+	}
+
+	// Execute copy
+	m_graphicsCommandQueue->ExecuteCommandLists(1, ppCommandLists);
+	if (AsynchronousComputeEnabled) {
+		m_graphicsCopyFenceValues[m_frameIndex] = m_graphicsCopyFenceValue;
+		m_graphicsCommandQueue->Signal(m_graphicsCopyFences[m_frameIndex].Get(), m_graphicsCopyFenceValue);
+	}
+
+	PIXBeginEvent(m_graphicsCommandQueue.Get(), 0, L"Render");
+	++m_graphicsCopyFenceValue;
+	RecordRenderCommandList();
+
+	// Execute the rendering
+	ppCommandLists[0] = { m_graphicsCommandLists[m_frameIndex].Get() };
+	m_graphicsCommandQueue->ExecuteCommandLists(1, ppCommandLists);
+	if (AsynchronousComputeEnabled) {
+		m_graphicsFenceValues[m_frameIndex] = m_graphicsFenceValue;
+		m_graphicsCommandQueue->Signal(m_graphicsFences[m_frameIndex].Get(), m_graphicsFenceValue);
+	}
+	PIXEndEvent(m_graphicsCommandQueue.Get());
+	++m_graphicsFenceValue;
+
+	// Present the frame.
+	ThrowIfFailed(m_swapChain->Present(0, 0));
+
+	MoveToNextFrame();
 }
+
+void D3D12ParticleSim::RecordCopyCommandList()
+{
+	ThrowIfFailed(m_graphicsCopyAllocators[m_frameIndex]->Reset());
+	ThrowIfFailed(m_graphicsCopyCommandLists[m_frameIndex]->Reset(m_graphicsCopyAllocators[m_frameIndex].Get(), m_pipelineState.Get()));
+
+	ID3D12GraphicsCommandList* commandList = m_graphicsCopyCommandLists[m_frameIndex].Get();
+
+	ID3D12Resource* particleBuffer = (GetParticleBufferSrvIndex() == 0) ? m_particleBuffer0.Get() : m_particleBuffer1.Get();
+
+	D3D12_RESOURCE_BARRIER barriers[2];
+	barriers[0] = CD3DX12_RESOURCE_BARRIER::Transition(
+		particleBuffer,
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+	commandList->ResourceBarrier(1, barriers);
+	commandList->CopyResource(m_particleBufferForDraw.Get(), particleBuffer);
+
+	barriers[0] = CD3DX12_RESOURCE_BARRIER::Transition(
+		particleBuffer,
+		D3D12_RESOURCE_STATE_COPY_SOURCE,
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	barriers[1] = CD3DX12_RESOURCE_BARRIER::Transition(
+		m_particleBufferForDraw.Get(),
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+	);
+
+	commandList->ResourceBarrier(2, barriers);
+	ThrowIfFailed(commandList->Close());
+}
+
+// Fill the command list with all the render commands and dependent state.
+void D3D12ParticleSim::RecordRenderCommandList()
+{
+	// Command list allocators can only be reset when the associated
+	// command lists have finished execution on the GPU; apps should use
+	// fences to determine GPU execution progress.
+	ThrowIfFailed(m_graphicsAllocators[m_frameIndex]->Reset());
+
+	// However, when ExecuteCommandList() is called on a particular command
+	// list, that command list can then be reset at any time and must be before
+	// re-recording.
+	ThrowIfFailed(m_graphicsCommandLists[m_frameIndex]->Reset(m_graphicsAllocators[m_frameIndex].Get(), m_pipelineState.Get()));
+
+	ID3D12GraphicsCommandList* commandList = m_graphicsCommandLists[m_frameIndex].Get();
+
+	// Set necessary state.
+	commandList->SetPipelineState(m_pipelineState.Get());
+	commandList->SetGraphicsRootSignature(m_rootSignature.Get());
+
+	commandList->SetGraphicsRootConstantBufferView(RootParameterCB, m_constantBufferGS->GetGPUVirtualAddress() + m_frameIndex * sizeof(ConstantBufferGS));
+
+	ID3D12DescriptorHeap* ppHeaps[] = { m_srvUavHeap.Get() };
+	commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+
+	commandList->IASetVertexBuffers(0, 1, &m_vertexBufferView);
+	commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+	commandList->RSSetScissorRects(1, &m_scissorRect);
+
+	// Indicate that the back buffer will be used as a render target.
+	commandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_renderTargets[m_frameIndex].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
+
+	CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(m_rtvHeap->GetCPUDescriptorHandleForHeapStart(), m_frameIndex, m_rtvDescriptorSize);
+	commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+
+	// Record commands.
+	const float clearColor[] = { 0.0f, 0.0f, 0.1f, 0.0f };
+	commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+
+	D3D12_VIEWPORT viewport;
+	viewport.TopLeftX = 0;
+	viewport.TopLeftY = 0;
+	viewport.Width = m_viewport.Width;
+	viewport.Height = m_viewport.Height;
+	viewport.MinDepth = D3D12_MIN_DEPTH;
+	viewport.MaxDepth = D3D12_MAX_DEPTH;
+	commandList->RSSetViewports(1, &viewport);
+
+	CD3DX12_GPU_DESCRIPTOR_HANDLE srvHandle(m_srvUavHeap->GetGPUDescriptorHandleForHeapStart(), SrvParticleForDraw, m_srvUavDescriptorSize);
+	commandList->SetGraphicsRootDescriptorTable(RootParameterSRV, srvHandle);
+	PIXBeginEvent(commandList, 0, L"Draw particles");
+	commandList->DrawInstanced(ParticleCount, 1, 0, 0);
+	PIXEndEvent(commandList);
+
+	commandList->RSSetViewports(1, &m_viewport);
+
+	D3D12_RESOURCE_BARRIER barriers[2];
+	barriers[0] = CD3DX12_RESOURCE_BARRIER::Transition(
+		m_particleBufferForDraw.Get(),
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_COPY_DEST);
+	barriers[1] = CD3DX12_RESOURCE_BARRIER::Transition(
+		m_renderTargets[m_frameIndex].Get(),
+		D3D12_RESOURCE_STATE_RENDER_TARGET,
+		D3D12_RESOURCE_STATE_PRESENT);
+
+	commandList->ResourceBarrier(2, barriers);
+
+	// Issue query
+	commandList->EndQuery(m_timeQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+		m_frameIndex);
+	commandList->ResolveQueryData(m_timeQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+		m_frameIndex, 1, m_timeQueryReadbackBuffer[m_frameIndex].Get(), 0);
+
+	ThrowIfFailed(commandList->Close());
+}
+
+void D3D12ParticleSim::RecordComputeCommandList()
+{
+	ID3D12CommandAllocator* pCommandAllocator = m_computeAllocators[m_frameIndex].Get();
+	ID3D12GraphicsCommandList* pCommandList = m_computeCommandLists[m_frameIndex].Get();
+
+	// Prepare for the next frame.
+	ThrowIfFailed(pCommandAllocator->Reset());
+	ThrowIfFailed(pCommandList->Reset(pCommandAllocator, m_computeState.Get()));
+
+	// Run the particle simulation multiple steps per frame
+	for (int i = 0; i < 4; ++i) {
+		Simulate();
+	}
+
+	ThrowIfFailed(pCommandList->Close());
+
+	// Swap the indices to the SRV and UAV.
+	m_srvIndex = 1 - m_srvIndex;
+}
+
+// Run the particle simulation using the compute shader.
+void D3D12ParticleSim::Simulate()
+{
+	ID3D12GraphicsCommandList* pCommandList = m_computeCommandLists[m_frameIndex].Get();
+	PIXScopedEvent(pCommandList, 0, "Simulation step");
+
+	UINT srvIndex;
+	UINT uavIndex;
+	ID3D12Resource* pUavResource;
+	if (GetParticleBufferSrvIndex() == 0)
+	{
+		srvIndex = SrvParticlePosVelo0;
+		uavIndex = UavParticlePosVelo1;
+		pUavResource = m_particleBuffer1.Get();
+	}
+	else
+	{
+		srvIndex = SrvParticlePosVelo1;
+		uavIndex = UavParticlePosVelo0;
+		pUavResource = m_particleBuffer0.Get();
+	}
+
+	pCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(pUavResource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+
+	pCommandList->SetPipelineState(m_computeState.Get());
+	pCommandList->SetComputeRootSignature(m_computeRootSignature.Get());
+
+	ID3D12DescriptorHeap* ppHeaps[] = { m_srvUavHeap.Get() };
+	pCommandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+
+	CD3DX12_GPU_DESCRIPTOR_HANDLE srvHandle(m_srvUavHeap->GetGPUDescriptorHandleForHeapStart(), srvIndex, m_srvUavDescriptorSize);
+	CD3DX12_GPU_DESCRIPTOR_HANDLE uavHandle(m_srvUavHeap->GetGPUDescriptorHandleForHeapStart(), uavIndex, m_srvUavDescriptorSize);
+
+	pCommandList->SetComputeRootConstantBufferView(RootParameterCB, m_constantBufferCS->GetGPUVirtualAddress());
+	pCommandList->SetComputeRootDescriptorTable(RootParameterSRV, srvHandle);
+	pCommandList->SetComputeRootDescriptorTable(RootParameterUAV, uavHandle);
+
+	pCommandList->Dispatch(static_cast<int>(ceil(ParticleCount / 256.0f)), 1, 1);
+
+	pCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(pUavResource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+}
+
 
 void D3D12ParticleSim::OnDestroy()
 {
-	WaitForPreviousFrame();
+	// Ensure the GPU is done rendering.
+	// Wait for all fences
+	for (int i = 0; i < FrameCount; ++i) {
+		if (AsynchronousComputeEnabled) {
+			WaitForFence(m_computeFences[i].Get(),
+				m_computeFenceValues[i], m_computeFenceEvents[i]);
+			WaitForFence(m_graphicsFences[i].Get(),
+				m_graphicsFenceValues[i], m_graphicsFenceEvents[i]);
+			WaitForFence(m_graphicsCopyFences[i].Get(),
+				m_graphicsCopyFenceValues[i], m_graphicsCopyFenceEvents[i]);
+		}
 
-	CloseHandle(m_fenceEvent);
-}
-
-void D3D12ParticleSim::PopulateCommandList()
-{
-	ThrowIfFailed(m_commandAllocator->Reset());
-	ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(), m_pipelineState.Get()));
-
-	m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
-
-	ID3D12DescriptorHeap* ppHeaps[] = { m_srvHeap.Get() };
-	m_commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
-
-	m_commandList->SetGraphicsRootDescriptorTable(0, m_srvHeap->GetGPUDescriptorHandleForHeapStart());
-
-	m_commandList->RSSetViewports(1, &m_viewport);
-	m_commandList->RSSetScissorRects(1, &m_scissorRect);
-	m_commandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_renderTargets[m_frameIndex].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
-
-	CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(m_rtvHeap->GetCPUDescriptorHandleForHeapStart(), m_frameIndex, m_rtvDescriptorSize);
-	m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
-	const float clearColor[] = { 0.1f, 1.0f, 1.0f, 1.0f };
-	m_commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-	m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	m_commandList->IASetVertexBuffers(0, 1, &m_vertexBufferView);
-	m_commandList->DrawInstanced(3, 1, 0, 0);
-	m_commandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_renderTargets[m_frameIndex].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
-
-	ThrowIfFailed(m_commandList->Close());
-}
-
-void D3D12ParticleSim::WaitForPreviousFrame()
-{
-	const UINT64 fence = m_fenceValue;
-	ThrowIfFailed(m_commandQueue->Signal(m_fence.Get(), fence));
-	m_fenceValue++;
-	if (m_fence->GetCompletedValue() < fence)
-	{
-		ThrowIfFailed(m_fence->SetEventOnCompletion(fence, m_fenceEvent));
-		WaitForSingleObject(m_fenceEvent, INFINITE);
+		WaitForFence(m_frameFences[i].Get(),
+			m_frameFenceValues[i], m_frameFenceEvents[i]);
 	}
 
+	// Close handles to fence events.
+	for (int i = 0; i < FrameCount; ++i) {
+		CloseHandle(m_computeFenceEvents[i]);
+		CloseHandle(m_graphicsFenceEvents[i]);
+		CloseHandle(m_graphicsCopyFenceEvents[i]);
+		CloseHandle(m_frameFenceEvents[i]);
+	}
+}
+
+
+
+void D3D12ParticleSim::OnKeyDown(UINT8 key)
+{
+	m_camera.OnKeyDown(key);
+}
+
+void D3D12ParticleSim::OnKeyUp(UINT8 key)
+{
+	m_camera.OnKeyUp(key);
+}
+
+// Cycle through the frame resources. This method blocks execution if the 
+// next frame resource in the queue has not yet had its previous contents 
+// processed by the GPU.
+void D3D12ParticleSim::MoveToNextFrame()
+{
+	// Assign the current fence value to the current frame.
+	m_frameFenceValues[m_frameIndex] = m_frameFenceValue;
+
+	// Signal and increment the fence value.
+	ThrowIfFailed(m_graphicsCommandQueue->Signal(m_frameFences[m_frameIndex].Get(), m_frameFenceValue));
+	++m_frameFenceValue;
+
+	// Update the frame index.
+	m_lastFrameIndex = m_frameIndex;
 	m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+
+	// If the next frame is not ready to be rendered yet, wait until it is ready.
+	WaitForFence(m_frameFences[m_frameIndex].Get(),
+		m_frameFenceValues[m_frameIndex], m_frameFenceEvents[m_frameIndex]);
+
+	// Update query
+	++m_queryReadbackIndex;
+
+	// This is trailing behind, assuming frame count = 4
+	// frameIndex:     0  1  2  3
+	// readbackIndex: -3 -2 -1  0
+	//                          \- Trigger readback of frame 0 now
+	//							We just waited for it to finish, so this is
+	//							safe, and we have not issued the query for
+	//							the next frame yet which will overwrite slot 0
+
+	if (m_queryReadbackIndex >= FrameCount) {
+		m_queryReadbackIndex = 0;
+	}
+
+	if (m_queryReadbackIndex >= 0) {
+		void* mapping = nullptr;
+		m_timeQueryReadbackBuffer[m_queryReadbackIndex]->Map(0, &CD3DX12_RANGE(0, sizeof(UINT64)), &mapping);
+		::memcpy(m_queryResults + m_queryReadbackIndex, mapping, sizeof(UINT64));
+		m_timeQueryReadbackBuffer[m_queryReadbackIndex]->Unmap(0, nullptr);
+
+		// Time is now previous to current
+		int previousQueryIndex = m_queryReadbackIndex - 1;
+		if (previousQueryIndex < 0) {
+			previousQueryIndex += FrameCount;
+		}
+
+		const double diffMs = static_cast<double>(m_queryResults[m_queryReadbackIndex] - m_queryResults[previousQueryIndex])
+			/ static_cast<double> (m_frequency) * 1000;
+
+		m_frameTimes[m_frameTimeNextEntry] = diffMs;
+		++m_frameTimeNextEntry;
+		if (m_frameTimeNextEntry >= m_frameTimes.size()) {
+			m_frameTimeNextEntry = 0;
+		}
+		++m_frameTimeEntryCount;
+
+		const auto validEntryCount = std::min(static_cast<size_t> (m_frameTimeEntryCount), m_frameTimes.size());
+		const auto sum = std::accumulate(m_frameTimes.begin(),
+			m_frameTimes.begin() + validEntryCount, 0.0);
+
+		const auto averageDiffMs = sum / validEntryCount;
+
+		auto titleString = std::to_string(averageDiffMs) + " ms (" + std::to_string(1000.0 / averageDiffMs) + " fps)";
+		if (AsynchronousComputeEnabled) {
+			titleString += " - Asynchronous Compute ENABLED";
+		}
+		else {
+			titleString += " - Asynchronous Compute DISABLED";
+		}
+
+		SetWindowTextA(Win32Application::GetHwnd(), titleString.c_str());
+	}
 }
 

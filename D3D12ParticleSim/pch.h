@@ -7,6 +7,7 @@
 #include <D3Dcompiler.h>
 #include <DirectXMath.h>
 #include "d3dx12.h"
+#include <pix3.h>
 
 #include <string>
 #include <vector>
