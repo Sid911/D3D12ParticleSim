@@ -33,6 +33,18 @@ int Win32Application::Run(DXWindow* pWindow, HINSTANCE hInstance, int nCmdShow)
 		nullptr,
 		hInstance,
 		pWindow);
+	// Setup Platform/Renderer backends
+	IMGUI_CHECKVERSION();
+	ImGui::CreateContext();
+	ImGuiIO& io = ImGui::GetIO(); (void)io;
+	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
+	//io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
+
+	// Setup Dear ImGui style
+	ImGui::StyleColorsDark();
+	//ImGui::StyleColorsClassic();
+	ImGui_ImplWin32_Init(m_hwnd);
+
 	pWindow->OnInit();
 
 	ShowWindow(m_hwnd, nCmdShow);

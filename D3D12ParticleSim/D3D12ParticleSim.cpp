@@ -70,6 +70,16 @@ void D3D12ParticleSim::OnInit()
 	LoadPipeline();
 	LoadAssets();
 }
+
+void D3D12ParticleSim::SetupImgui() {
+	// Setup Imgui 
+	ImGui_ImplDX12_Init(m_device.Get(), FrameCount,
+		DXGI_FORMAT_R8G8B8A8_UNORM, m_srvUavHeap.Get(),
+		m_srvUavHeap->GetCPUDescriptorHandleForHeapStart(),
+		m_srvUavHeap->GetGPUDescriptorHandleForHeapStart());
+
+}
+
 void D3D12ParticleSim::LoadPipeline()
 {
 #if defined(_DEBUG)
@@ -144,24 +154,35 @@ void D3D12ParticleSim::LoadPipeline()
 
 	m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
 	m_lastFrameIndex = m_frameIndex;
+
 	{
 		D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
 		rtvHeapDesc.NumDescriptors = FrameCount;
 		rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
 		rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-		ThrowIfFailed(m_device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&m_rtvHeap)));\
+		ThrowIfFailed(m_device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&m_rtvHeap)));
 
 
-		D3D12_DESCRIPTOR_HEAP_DESC srvUavHeapDesc = {};
+			D3D12_DESCRIPTOR_HEAP_DESC srvUavHeapDesc = {};
 		srvUavHeapDesc.NumDescriptors = DescriptorCount;
 		srvUavHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 		srvUavHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 		ThrowIfFailed(m_device->CreateDescriptorHeap(&srvUavHeapDesc, IID_PPV_ARGS(&m_srvUavHeap)));
 		NAME_D3D12_OBJECT(m_srvUavHeap);
+		
+		//D3D12_DESCRIPTOR_HEAP_DESC srvImGUIHeapDesc = {};
+		//srvImGUIHeapDesc.NumDescriptors = 1;
+		//srvImGUIHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		//srvImGUIHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+		//ThrowIfFailed(m_device->CreateDescriptorHeap(&srvImGUIHeapDesc, IID_PPV_ARGS(&m_srvImGUIHeap)));
+		//NAME_D3D12_OBJECT(m_srvImGUIHeap);
 
 		m_rtvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 		m_srvUavDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		//m_srvImGUIDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 	}
+
+	SetupImgui();
 	{
 		CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(m_rtvHeap->GetCPUDescriptorHandleForHeapStart());
 		for (UINT n = 0; n < FrameCount; n++)
@@ -647,6 +668,9 @@ void D3D12ParticleSim::OnUpdate()
 {
 	// Wait for the previous Present to complete.
 // WaitForSingleObjectEx(m_swapChainEvent, 100, FALSE);
+	ImGui_ImplDX12_NewFrame();
+	ImGui_ImplWin32_NewFrame();
+	ImGui::NewFrame();
 
 	m_timer.Tick(NULL);
 	m_camera.Update(static_cast<float>(m_timer.GetElapsedSeconds()));
@@ -767,6 +791,28 @@ void D3D12ParticleSim::RecordRenderCommandList()
 	// re-recording.
 	ThrowIfFailed(m_graphicsCommandLists[m_frameIndex]->Reset(m_graphicsAllocators[m_frameIndex].Get(), m_pipelineState.Get()));
 
+	// 2. Show a simple window that we create ourselves. We use a Begin/End pair to created a named window.
+	{
+		static float f = 0.0f;
+		static int counter = 0;
+
+		ImGui::Begin("Hello, world!");                          // Create a window called "Hello, world!" and append into it.
+
+		ImGui::Text("This is some useful text.");               // Display some text (you can use a format strings too)
+
+		ImGui::SliderFloat("float", &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
+		ImGui::Text(" This is justa stuffffffffffff "); // Edit 3 floats representing a color
+
+		if (ImGui::Button("Button"))                            // Buttons return true when clicked (most widgets return true when edited/activated)
+			counter++;
+		ImGui::SameLine();
+		ImGui::Text("counter = %d", counter);
+
+		ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
+		ImGui::End();
+	}
+	ImGui::Render();
+
 	ID3D12GraphicsCommandList* commandList = m_graphicsCommandLists[m_frameIndex].Get();
 
 	// Set necessary state.
@@ -775,8 +821,10 @@ void D3D12ParticleSim::RecordRenderCommandList()
 
 	commandList->SetGraphicsRootConstantBufferView(RootParameterCB, m_constantBufferGS->GetGPUVirtualAddress() + m_frameIndex * sizeof(ConstantBufferGS));
 
-	ID3D12DescriptorHeap* ppHeaps[] = { m_srvUavHeap.Get() };
+	ID3D12DescriptorHeap* ppHeaps[] = { m_srvUavHeap.Get()};
 	commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+	//ID3D12DescriptorHeap* pp2Heaps[] = { m_srvImGUIHeap.Get() };
+	//commandList->SetDescriptorHeaps(1, pp2Heaps);
 
 	commandList->IASetVertexBuffers(0, 1, &m_vertexBufferView);
 	commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
@@ -800,6 +848,8 @@ void D3D12ParticleSim::RecordRenderCommandList()
 	viewport.MinDepth = D3D12_MIN_DEPTH;
 	viewport.MaxDepth = D3D12_MAX_DEPTH;
 	commandList->RSSetViewports(1, &viewport);
+
+	ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
 
 	CD3DX12_GPU_DESCRIPTOR_HANDLE srvHandle(m_srvUavHeap->GetGPUDescriptorHandleForHeapStart(), SrvParticleForDraw, m_srvUavDescriptorSize);
 	commandList->SetGraphicsRootDescriptorTable(RootParameterSRV, srvHandle);
@@ -918,6 +968,9 @@ void D3D12ParticleSim::OnDestroy()
 		CloseHandle(m_graphicsCopyFenceEvents[i]);
 		CloseHandle(m_frameFenceEvents[i]);
 	}
+	ImGui_ImplDX12_Shutdown();
+	ImGui_ImplWin32_Shutdown();
+	ImGui::DestroyContext();
 }
 
 

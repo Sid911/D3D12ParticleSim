@@ -75,9 +75,11 @@ private:
 	ComPtr<ID3D12RootSignature> m_rootSignature;
 	ComPtr<ID3D12RootSignature> m_computeRootSignature;
 	ComPtr<ID3D12DescriptorHeap> m_rtvHeap;
+	//ComPtr<ID3D12DescriptorHeap> m_srvImGUIHeap;
 	ComPtr<ID3D12DescriptorHeap> m_srvUavHeap;
 	UINT m_rtvDescriptorSize;
 	UINT m_srvUavDescriptorSize;
+	//UINT m_srvImGUIDescriptorSize;
 
 	// Timing queries
 	ComPtr<ID3D12QueryHeap> m_timeQueryHeap;
@@ -165,9 +167,11 @@ private:
 		DescriptorCount
 	};
 
+	void SetupImgui();
 	void LoadPipeline();
 	void LoadAssets();
 	void CreateVertexBuffer();
+
 	float RandomPercent();
 	void LoadParticles(_Out_writes_(numParticles) Particle* pParticles, const XMFLOAT3& center, const XMFLOAT4& velocity, float spread, UINT numParticles);
 	void CreateParticleBuffers();
