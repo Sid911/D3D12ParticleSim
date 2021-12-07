@@ -37,7 +37,7 @@ void DXWindow::GetHardwareAdapter(IDXGIFactory2* pFactory, IDXGIAdapter1** ppAda
 		{
 			continue;
 		}
-		if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device), nullptr)))
+		if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, _uuidof(ID3D12Device), nullptr)))
 		{
 			break;
 		}

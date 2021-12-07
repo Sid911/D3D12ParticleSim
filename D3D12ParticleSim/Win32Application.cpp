@@ -90,3 +90,5 @@ LRESULT CALLBACK Win32Application::WindowProc(HWND hWnd, UINT message, WPARAM wP
 	}
 	return DefWindowProc(hWnd, message, wParam, lParam);
 }
+
+

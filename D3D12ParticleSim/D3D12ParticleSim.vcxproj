@@ -175,6 +175,13 @@
     <ClCompile Include="Camera.cpp" />
     <ClCompile Include="D3D12ParticleSim.cpp" />
     <ClCompile Include="DXWindow.cpp" />
+    <ClCompile Include="imgui.cpp" />
+    <ClCompile Include="imgui_demo.cpp" />
+    <ClCompile Include="imgui_draw.cpp" />
+    <ClCompile Include="imgui_impl_dx12.cpp" />
+    <ClCompile Include="imgui_impl_win32.cpp" />
+    <ClCompile Include="imgui_tables.cpp" />
+    <ClCompile Include="imgui_widgets.cpp" />
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="Win32Application.cpp" />
   </ItemGroup>
@@ -184,6 +191,14 @@
     <ClInclude Include="d3dx12.h" />
     <ClInclude Include="DXWindow.h" />
     <ClInclude Include="DXWindowHelper.h" />
+    <ClInclude Include="imconfig.h" />
+    <ClInclude Include="imgui.h" />
+    <ClInclude Include="imgui_impl_dx12.h" />
+    <ClInclude Include="imgui_impl_win32.h" />
+    <ClInclude Include="imgui_internal.h" />
+    <ClInclude Include="imstb_rectpack.h" />
+    <ClInclude Include="imstb_textedit.h" />
+    <ClInclude Include="imstb_truetype.h" />
     <ClInclude Include="MyTimer.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="resource.h" />
